@@ -6,7 +6,8 @@
 	"scripts": {
 		"build": "rollup -c",
 		"watch": "rollup -cw",
-		"prepack": "npm run build"
+		"prepack": "npm run build",
+		"prepare": "npm run build"
 	},
 	"author": "",
 	"files": [

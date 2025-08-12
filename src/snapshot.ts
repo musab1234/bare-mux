@@ -1,6 +1,6 @@
 export const nativeFetch = globalThis.fetch;
 export const nativeWebSocket = globalThis.WebSocket;
-export const nativeSharedWorker = globalThis.SharedWorker;
+export const nativeBroadcastChannel = globalThis.BroadcastChannel;
 export const nativeLocalStorage = globalThis.localStorage;
 export const nativeServiceWorker = globalThis.navigator.serviceWorker;
 export const nativePostMessage = MessagePort.prototype.postMessage;

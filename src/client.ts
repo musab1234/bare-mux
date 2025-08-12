@@ -99,8 +99,10 @@ export class BareMuxConnection {
 		}, [channel.port2]);
 	}
 
-	getInnerPort(): MessagePort | Promise<MessagePort> {
-		return this.worker.port;
+	getInnerPort(): Promise<boolean> {
+		// BroadcastChannel-based implementation doesn't use MessagePort
+		// Return worker readiness status instead
+		return this.worker.workerReady;
 	}
 }
 

@@ -1,5 +1,9 @@
 import { BareHeaders, TransferrableResponse } from "./baretypes";
-import { nativeLocalStorage, nativePostMessage, nativeServiceWorker, nativeSharedWorker } from "./snapshot";
+import { nativeLocalStorage, nativePostMessage, nativeServiceWorker, nativeBroadcastChannel } from "./snapshot";
+import { initializeBroadcastWorker } from "./broadcastWorker";
+
+// Check if SharedWorker is available for fallback
+const hasSharedWorker = typeof SharedWorker !== 'undefined';
 
 type SWClient = { postMessage: typeof MessagePort.prototype.postMessage };
 
@@ -39,67 +43,103 @@ export type BroadcastMessage = {
 	type: "refreshPort",
 }
 
-async function searchForPort(): Promise<MessagePort> {
-	// @ts-expect-error
-	const clients: SWClient[] = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
-	const promises: Promise<MessagePort>[] = clients.map(async (x: SWClient) => {
-		const port = await tryGetPort(x);
-		await testPort(port);
-		return port;
+async function searchForWorker(): Promise<boolean> {
+	// Check if there's an active worker via BroadcastChannel
+	const workerChannel = new nativeBroadcastChannel("bare-mux-worker");
+	const promise: Promise<boolean> = new Promise((resolve, reject) => {
+		const timeout = setTimeout(() => {
+			workerChannel.close();
+			reject(new Error("timeout"));
+		}, 500); // Reduced timeout for faster detection
+		
+		workerChannel.addEventListener("message", (event) => {
+			if (event.data.type === "worker-pong" || event.data.type === "worker-elected") {
+				clearTimeout(timeout);
+				workerChannel.close();
+				resolve(true);
+			}
+		});
+		
+		// Send ping and also trigger election in case no worker is active
+		workerChannel.postMessage({ type: "worker-ping" });
+		setTimeout(() => {
+			workerChannel.postMessage({ type: "elect-worker", workerId: "client-ping" });
+		}, 50);
 	});
-	const promise: Promise<MessagePort> = Promise.race([
-		Promise.any(promises),
-		new Promise((_, reject) => setTimeout(reject, 1000, new TypeError("timeout")))
-	]) as Promise<MessagePort>;
 
 	try {
 		return await promise;
 	} catch (err) {
-		if (err instanceof AggregateError) {
-			console.error("bare-mux: failed to get a bare-mux SharedWorker MessagePort as all clients returned an invalid MessagePort.");
-			throw new Error("All clients returned an invalid MessagePort.");
-		}
-		console.warn("bare-mux: failed to get a bare-mux SharedWorker MessagePort within 1s, retrying");
-		return await searchForPort();
+		console.warn("bare-mux: failed to find active worker within 500ms, will start new worker");
+		return false;
 	}
 }
 
-function tryGetPort(client: SWClient): Promise<MessagePort> {
-	let channel = new MessageChannel();
-	return new Promise(resolve => {
-		client.postMessage({ type: "getPort", port: channel.port2 }, [channel.port2]);
-		channel.port1.onmessage = event => {
-			resolve(event.data)
-		}
-	});
+let workerInitialized = false;
+
+async function ensureWorkerExists(): Promise<void> {
+	if (workerInitialized) return;
+	
+	// Initialize the broadcast worker
+	initializeBroadcastWorker();
+	workerInitialized = true;
+	
+	// Give the worker a moment to initialize
+	await new Promise(resolve => setTimeout(resolve, 100));
 }
 
-function testPort(port: MessagePort): Promise<void> {
-	const pingChannel = new MessageChannel();
+function testWorker(): Promise<void> {
+	const responseChannelName = `bare-mux-response-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+	const responseChannel = new nativeBroadcastChannel(responseChannelName);
+	const workerChannel = new nativeBroadcastChannel("bare-mux-worker");
+	
 	const pingPromise: Promise<void> = new Promise((resolve, reject) => {
-		pingChannel.port1.onmessage = event => {
+		const timeout = setTimeout(() => {
+			responseChannel.close();
+			workerChannel.close();
+			reject(new Error("timeout"));
+		}, 1500);
+		
+		responseChannel.addEventListener("message", (event) => {
 			if (event.data.type === "pong") {
+				clearTimeout(timeout);
+				responseChannel.close();
+				workerChannel.close();
 				resolve();
 			}
-		};
-		setTimeout(reject, 1500);
+		});
+		
+		workerChannel.postMessage({
+			type: "worker-request",
+			data: { message: { type: "ping" } },
+			responseChannel: responseChannelName
+		});
 	});
-	nativePostMessage.call(port, <WorkerRequest>{ message: { type: "ping" }, port: pingChannel.port2 }, [pingChannel.port2]);
+	
 	return pingPromise;
 }
 
-function createPort(path: string, registerHandlers: boolean): MessagePort {
-	const worker = new nativeSharedWorker(path, "bare-mux-worker");
-	if (registerHandlers) {
+async function createWorkerConnection(path?: string, registerHandlers?: boolean): Promise<boolean> {
+	// Check if worker already exists
+	const hasWorker = await searchForWorker();
+	if (hasWorker) {
+		return true;
+	}
+	
+	// Ensure worker is initialized
+	await ensureWorkerExists();
+	
+	if (registerHandlers && nativeServiceWorker) {
 		nativeServiceWorker.addEventListener("message", (event: MessageEvent) => {
 			if (event.data.type === "getPort" && event.data.port) {
-				console.debug("bare-mux: recieved request for port from sw");
-				const newWorker = new nativeSharedWorker(path, "bare-mux-worker");
-				nativePostMessage.call(event.data.port, newWorker.port, [newWorker.port]);
+				console.debug("bare-mux: received request for connection from sw");
+				// For service worker requests, we just confirm the worker exists
+				nativePostMessage.call(event.data.port, { connected: true });
 			}
 		});
 	}
-	return worker.port;
+	
+	return true;
 }
 
 let browserSupportsTransferringStreamsCache: boolean | null = null;
@@ -123,59 +163,144 @@ export function browserSupportsTransferringStreams(): boolean {
 
 export class WorkerConnection {
 	channel: BroadcastChannel;
-	port: MessagePort | Promise<MessagePort>;
+	workerReady: Promise<boolean>;
 	workerPath: string;
+	sharedWorkerPort?: MessagePort | Promise<MessagePort>;
+	useSharedWorker: boolean = false;
 
 	constructor(worker?: string | Promise<MessagePort> | MessagePort) {
 		this.channel = new BroadcastChannel("bare-mux");
 		if (worker instanceof MessagePort || worker instanceof Promise) {
-			this.port = worker;
+			// For backward compatibility, treat MessagePort as ready
+			this.sharedWorkerPort = worker;
+			this.useSharedWorker = true;
+			this.workerReady = Promise.resolve(true);
 		} else {
-			this.createChannel(worker, true);
+			this.workerReady = this.createChannel(worker, true);
 		}
 	}
 
-	createChannel(workerPath?: string, inInit?: boolean) {
+	async createChannel(workerPath?: string, inInit?: boolean): Promise<boolean> {
 		// @ts-expect-error
 		if (self.clients) {
 			// running in a ServiceWorker
-			// ask a window for the worker port, register for refreshPort
-			this.port = searchForPort();
+			// ensure worker exists and register for refreshPort
+			const hasWorker = await createWorkerConnection(workerPath, inInit);
 			this.channel.onmessage = (event: MessageEvent) => {
 				if (event.data.type === "refreshPort") {
-					this.port = searchForPort();
+					// Refresh worker connection
+					this.workerReady = createWorkerConnection(workerPath, false);
 				}
 			}
-		} else if (workerPath && SharedWorker) {
+			return hasWorker;
+		} else if (workerPath && nativeBroadcastChannel) {
 			// running in a window, was passed a workerPath
-			// create the SharedWorker and help other bare-mux clients get the workerPath
+			// create the BroadcastChannel worker and help other bare-mux clients get the workerPath
 
 			if (!workerPath.startsWith("/") && !workerPath.includes("://")) throw new Error("Invalid URL. Must be absolute or start at the root.");
-			this.port = createPort(workerPath, inInit);
+			const connected = await createWorkerConnection(workerPath, inInit);
 			console.debug("bare-mux: setting localStorage bare-mux-path to", workerPath);
 			nativeLocalStorage["bare-mux-path"] = workerPath;
-		} else if (SharedWorker) {
+			return connected;
+		} else if (nativeBroadcastChannel) {
 			// running in a window, was not passed a workerPath
-			// use sessionStorage for the workerPath
+			// use localStorage for the workerPath
 			const path = nativeLocalStorage["bare-mux-path"];
 			console.debug("bare-mux: got localStorage bare-mux-path:", path);
 			if (!path) throw new Error("Unable to get bare-mux workerPath from localStorage.");
-			this.port = createPort(path, inInit);
+			return await createWorkerConnection(path, inInit);
 		} else {
-			// SharedWorker does not exist
-			throw new Error("Unable to get a channel to the SharedWorker.");
+			// BroadcastChannel does not exist
+			throw new Error("Unable to get a channel to the BroadcastChannel worker.");
 		}
 	}
 
 	async sendMessage(message: WorkerMessage, transferable?: Transferable[]): Promise<WorkerResponse> {
-		if (this.port instanceof Promise) this.port = await this.port;
+		// Check if we should use SharedWorker fallback for operations that need MessagePort transfers
+		const needsMessagePortTransfer = message.type === "websocket" || (transferable && transferable.length > 0);
+		
+		if (needsMessagePortTransfer && hasSharedWorker && !this.useSharedWorker) {
+			console.debug("bare-mux: Using SharedWorker fallback for MessagePort transfer operation");
+			return await this.sendMessageViaSharedWorker(message, transferable);
+		}
+		
+		if (this.useSharedWorker) {
+			return await this.sendMessageViaSharedWorker(message, transferable);
+		}
+
+		// Ensure worker is ready
+		await this.workerReady;
 
 		try {
-			await testPort(this.port);
+			await testWorker();
 		} catch {
-			console.warn("bare-mux: Failed to get a ping response from the worker within 1.5s. Assuming port is dead.");
-			this.createChannel();
+			console.warn("bare-mux: Failed to get a ping response from the worker within 1.5s. Assuming worker is dead.");
+			this.workerReady = this.createChannel();
 			return await this.sendMessage(message, transferable);
+		}
+
+		// Create unique response channel for this request
+		const responseChannelName = `bare-mux-response-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+		const responseChannel = new nativeBroadcastChannel(responseChannelName);
+		const workerChannel = new nativeBroadcastChannel("bare-mux-worker");
+
+		const promise: Promise<WorkerResponse> = new Promise((resolve, reject) => {
+			const timeout = setTimeout(() => {
+				responseChannel.close();
+				workerChannel.close();
+				reject(new Error("Worker request timeout"));
+			}, 10000);
+			
+			responseChannel.addEventListener("message", (event) => {
+				const response = event.data;
+				clearTimeout(timeout);
+				responseChannel.close();
+				workerChannel.close();
+				
+				if (response.type === "error") {
+					reject(response.error);
+				} else {
+					resolve(response);
+				}
+			});
+		});
+
+		// Send message to worker
+		workerChannel.postMessage({
+			type: "worker-request",
+			data: { message },
+			responseChannel: responseChannelName
+		});
+
+		return await promise;
+	}
+
+	async sendMessageViaSharedWorker(message: WorkerMessage, transferable?: Transferable[]): Promise<WorkerResponse> {
+		// Create or get SharedWorker connection for fallback
+		if (!this.sharedWorkerPort) {
+			// Create SharedWorker fallback
+			const workerPath = this.workerPath || nativeLocalStorage["bare-mux-path"];
+			if (!workerPath) {
+				throw new Error("No SharedWorker path available for fallback");
+			}
+			const worker = new SharedWorker(workerPath, "bare-mux-worker");
+			this.sharedWorkerPort = worker.port;
+		}
+		
+		const port = this.sharedWorkerPort instanceof Promise ? await this.sharedWorkerPort : this.sharedWorkerPort;
+		
+		// Test the SharedWorker port
+		try {
+			await this.testSharedWorkerPort(port);
+		} catch {
+			console.warn("bare-mux: SharedWorker port failed, recreating...");
+			const workerPath = this.workerPath || nativeLocalStorage["bare-mux-path"];
+			if (!workerPath) {
+				throw new Error("No SharedWorker path available for fallback");
+			}
+			const worker = new SharedWorker(workerPath, "bare-mux-worker");
+			this.sharedWorkerPort = worker.port;
+			return await this.sendMessageViaSharedWorker(message, transferable);
 		}
 
 		const channel = new MessageChannel();
@@ -183,17 +308,31 @@ export class WorkerConnection {
 
 		const promise: Promise<WorkerResponse> = new Promise((resolve, reject) => {
 			channel.port1.onmessage = event => {
-				const message = event.data;
-				if (message.type === "error") {
-					reject(message.error);
+				const response = event.data;
+				if (response.type === "error") {
+					reject(response.error);
 				} else {
-					resolve(message);
+					resolve(response);
 				}
 			}
 		});
 
-		nativePostMessage.call(this.port, <WorkerRequest>{ message: message, port: channel.port2 }, toTransfer);
+		nativePostMessage.call(port, { message: message, port: channel.port2 }, toTransfer);
 
 		return await promise;
+	}
+
+	async testSharedWorkerPort(port: MessagePort): Promise<void> {
+		const pingChannel = new MessageChannel();
+		const pingPromise: Promise<void> = new Promise((resolve, reject) => {
+			pingChannel.port1.onmessage = event => {
+				if (event.data.type === "pong") {
+					resolve();
+				}
+			};
+			setTimeout(reject, 1500);
+		});
+		nativePostMessage.call(port, { message: { type: "ping" }, port: pingChannel.port2 }, [pingChannel.port2]);
+		return pingPromise;
 	}
 }
